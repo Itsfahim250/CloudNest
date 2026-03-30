@@ -1,9 +1,5 @@
 import telebot
 from telebot import types
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import random
 import json
 import os
 import uuid
@@ -12,19 +8,15 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-# --- CONFIGURATION (Environment Variables for Render) ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "7992380671:AAE9euDdBd1rQ93RkYhWlbGYUvoopVR-L3Q")
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "freemessagebomber@gmail.com")
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "dkwu zjdt pzkv siup")
+# --- CONFIGURATION ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7992380671:AAE9euDdBd1rQ93RkYhWlbGYUvoopVR-L3Q") # শুধু Render এ টোকেন বসালেই হবে
 PORT = int(os.environ.get("PORT", 8080))
-HOST_URL = os.environ.get("HOST_URL", "http://127.0.0.1:8080") # Render এ আপনার ওয়েবসাইটের লিংক দিবেন
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 CORS(app)
 
 # --- DIRECTORY SETUP ---
-# Render এ ডাটা সেভ রাখার জন্য একটি নির্দিষ্ট ফোল্ডার
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 USER_DATA_FILE = os.path.join(DATA_DIR, "users.json")
@@ -44,35 +36,237 @@ def save_users(users):
 
 def get_dev_by_api_key(api_key):
     users = load_users()
-    for email, info in users.items():
+    for user_id, info in users.items():
         if info.get('api_key') == api_key:
-            return email, info
+            return user_id, info
     return None, None
 
-# --- EMAIL OTP FUNCTION ---
-def send_otp_email(receiver_email, otp):
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = f"CloudNest <{SENDER_EMAIL}>"
-        msg['To'] = receiver_email
-        msg['Subject'] = "Your CloudNest OTP Code"
-        body = f"<h2>Welcome to CloudNest!</h2><p>Your verification code is: <strong>{otp}</strong></p>"
-        msg.attach(MIMEText(body, 'html'))
+# --- DYNAMIC HOST URL (Auto detect for Render) ---
+def get_host_url():
+    # Render নিজে থেকেই RENDER_EXTERNAL_URL প্রোভাইড করে, তাই আপনাকে লিংক বসাতে হবে না।
+    return os.environ.get("RENDER_EXTERNAL_URL", "http://127.0.0.1:8080").rstrip('/')
 
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(SENDER_EMAIL, APP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        return True
-    except Exception as e:
-        print(f"Email Error: {e}")
-        return False
 
 # ==========================================
 #         FLASK API SERVER FOR APP
 # ==========================================
 
+# 1. DATABASE API
+@app.route('/api/db', methods=['POST'])
+def api_db():
+    data = request.json
+    api_key = data.get('api_key')
+    action = data.get('action')
+    key = data.get('key', 'default')
+    payload = data.get('data', '')
+
+    user_id, dev_info = get_dev_by_api_key(api_key)
+    if not user_id: return jsonify({"status": "error", "message": "Invalid API Key."})
+
+    db_file = os.path.join(DATA_DIR, f"{dev_info['api_key']}_db.json")
+    db_data = {}
+    if os.path.exists(db_file):
+        with open(db_file, "r") as f: db_data = json.load(f)
+
+    if action == 'save':
+        db_data[key] = payload
+        with open(db_file, "w") as f: json.dump(db_data, f)
+        return jsonify({"status": "success", "message": "Data saved!"})
+    elif action == 'load':
+        return jsonify({"status": "success", "data": db_data.get(key, "")})
+
+    return jsonify({"status": "error", "message": "Invalid action."})
+
+# 2. AUTHENTICATION API
+@app.route('/api/auth', methods=['POST'])
+def api_auth():
+    data = request.json
+    api_key = data.get('api_key')
+    action = data.get('action')
+    username = data.get('username')
+    password = data.get('password')
+
+    user_id, dev_info = get_dev_by_api_key(api_key)
+    if not user_id: return jsonify({"status": "error", "message": "Invalid API Key."})
+
+    auth_file = os.path.join(DATA_DIR, f"{dev_info['api_key']}_auth.json")
+    auth_data = {}
+    if os.path.exists(auth_file):
+        with open(auth_file, "r") as f: auth_data = json.load(f)
+
+    if action == 'register':
+        if username in auth_data:
+            return jsonify({"status": "error", "message": "User exists!"})
+        auth_data[username] = {"password": password}
+        with open(auth_file, "w") as f: json.dump(auth_data, f)
+        return jsonify({"status": "success", "message": "Registered successfully!"})
+    elif action == 'login':
+        if username in auth_data and auth_data[username]['password'] == password:
+            return jsonify({"status": "success", "message": "Logged in successfully!"})
+        return jsonify({"status": "error", "message": "Wrong credentials."})
+    
+    return jsonify({"status": "error", "message": "Invalid action."})
+
+# 3. FILE UPLOAD API
+@app.route('/api/upload', methods=['POST'])
+def upload_file():
+    api_key = request.form.get('api_key')
+    user_id, dev_info = get_dev_by_api_key(api_key)
+    if not user_id: return jsonify({"status":"error", "message":"Invalid API key"})
+
+    if 'file' not in request.files: return jsonify({"status":"error", "message":"No file uploaded"})
+    file = request.files['file']
+    if file.filename == '': return jsonify({"status":"error", "message":"Empty file"})
+    
+    filename = secure_filename(file.filename)
+    unique_filename = f"{dev_info['api_key']}_{uuid.uuid4().hex[:8]}_{filename}"
+    file.save(os.path.join(UPLOAD_FOLDER, unique_filename))
+    
+    file_url = f"{get_host_url()}/uploads/{unique_filename}"
+    return jsonify({"status": "success", "url": file_url})
+
+# 4. LOAD FILE API
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(UPLOAD_FOLDER, filename)
+
+
+# ==========================================
+#         TELEGRAM BOT LOGIC
+# ==========================================
+
+@bot.message_handler(commands=['start', 'restart'])
+def send_welcome(message):
+    chat_id = str(message.chat.id)
+    users = load_users()
+
+    # Auto Registration logic via Telegram ID
+    if chat_id not in users:
+        api_key = "cn_" + str(uuid.uuid4()).replace("-", "")
+        users[chat_id] = {"api_key": api_key, "telegram_id": chat_id}
+        save_users(users)
+        bot.send_message(chat_id, "🎉 **Account Auto-Registered!**\nYour account has been securely linked to your Telegram ID.", parse_mode="Markdown")
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add("Database", "Authentication", "Project Settings")
+    bot.send_message(chat_id, "Welcome to ☁️ **CloudNest Backend Manager**!\n\n_You are securely logged in._", parse_mode="Markdown", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: True)
+def handle_messages(message):
+    chat_id = str(message.chat.id)
+    text = message.text
+    users = load_users()
+
+    if chat_id not in users:
+        bot.send_message(chat_id, "Please press /start to initialize your account.")
+        return
+
+    user_info = users[chat_id]
+
+    if text == "Database":
+        db_file = os.path.join(DATA_DIR, f"{user_info['api_key']}_db.json")
+        if os.path.exists(db_file):
+            with open(db_file, "r") as f: db_data = json.load(f)
+            msg = "🗄 **Your Database Entries:**\n\n"
+            for key, val in db_data.items():
+                msg += f"🔑 `{key}` : {str(val)[:20]}...\n"
+            bot.send_message(chat_id, msg, parse_mode="Markdown")
+        else:
+            bot.send_message(chat_id, "🗄 **Database is Empty!**", parse_mode="Markdown")
+
+    elif text == "Authentication":
+        auth_file = os.path.join(DATA_DIR, f"{user_info['api_key']}_auth.json")
+        if os.path.exists(auth_file):
+            with open(auth_file, "r") as f: auth_data = json.load(f)
+            if auth_data:
+                msg = "👥 **App Users List:**\n\n"
+                for username, details in auth_data.items():
+                    msg += f"👤 Username: `{username}`\n🔑 Password: `{details['password']}`\n\n"
+                bot.send_message(chat_id, msg, parse_mode="Markdown")
+            else:
+                bot.send_message(chat_id, "No users registered yet.")
+        else:
+            bot.send_message(chat_id, "No users registered yet.")
+
+    elif text == "Project Settings":
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("💻 Database API Code", callback_data="code_db"))
+        markup.add(types.InlineKeyboardButton("💻 Auth API Code", callback_data="code_auth"))
+        markup.add(types.InlineKeyboardButton("📁 File Upload Code", callback_data="code_upload"))
+        bot.send_message(chat_id, f"⚙️ **Your API Key:**\n`{user_info['api_key']}`\n\n_Click below to copy your HTML/JS code!_", parse_mode="Markdown", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    chat_id = str(call.message.chat.id)
+    users = load_users()
+    
+    if chat_id not in users:
+        bot.answer_callback_query(call.id, "Please press /start first.")
+        return
+
+    user_info = users[chat_id]
+    api_key = user_info['api_key']
+    host = get_host_url()
+
+    if call.data == "code_db":
+        code = f"""// --- DATA SAVE ---
+fetch('{host}/api/db', {{
+  method: 'POST',
+  headers: {{'Content-Type': 'application/json'}},
+  body: JSON.stringify({{api_key: '{api_key}', action: 'save', key: 'message_1', data: 'Hello World'}})
+}});
+
+// --- DATA LOAD ---
+fetch('{host}/api/db', {{
+  method: 'POST',
+  headers: {{'Content-Type': 'application/json'}},
+  body: JSON.stringify({{api_key: '{api_key}', action: 'load', key: 'message_1'}})
+}}).then(res => res.json()).then(console.log);"""
+        bot.send_message(chat_id, f"**Database API Code:**\n```javascript\n{code}\n```", parse_mode="Markdown")
+        
+    elif call.data == "code_upload":
+        code = f"""// HTML: <input type="file" id="fileInput">
+const fileInput = document.getElementById('fileInput');
+const formData = new FormData();
+formData.append('file', fileInput.files[0]);
+formData.append('api_key', '{api_key}');
+
+// --- FILE UPLOAD (Image/Video/APK) ---
+fetch('{host}/api/upload', {{
+  method: 'POST',
+  body: formData
+}}).then(res => res.json()).then(data => {{
+    console.log('File URL:', data.url); 
+}});"""
+        bot.send_message(chat_id, f"**File Upload API Code:**\n```javascript\n{code}\n```", parse_mode="Markdown")
+
+    elif call.data == "code_auth":
+        code = f"""// --- REGISTER USER ---
+fetch('{host}/api/auth', {{
+  method: 'POST',
+  headers: {{'Content-Type': 'application/json'}},
+  body: JSON.stringify({{api_key: '{api_key}', action: 'register', username: 'user1', password: '123'}})
+}});
+
+// --- LOGIN USER ---
+fetch('{host}/api/auth', {{
+  method: 'POST',
+  headers: {{'Content-Type': 'application/json'}},
+  body: JSON.stringify({{api_key: '{api_key}', action: 'login', username: 'user1', password: '123'}})
+}}).then(res => res.json()).then(console.log);"""
+        bot.send_message(chat_id, f"**Auth API Code:**\n```javascript\n{code}\n```", parse_mode="Markdown")
+
+
+# --- RUN SYSTEM ---
+def run_api_server():
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
+
+if __name__ == '__main__':
+    server_thread = threading.Thread(target=run_api_server)
+    server_thread.start()
+    print("Telegram Bot and API Server are running...")
+    bot.polling(non_stop=True)
 # 1. DATABASE API
 @app.route('/api/db', methods=['POST'])
 def api_db():
